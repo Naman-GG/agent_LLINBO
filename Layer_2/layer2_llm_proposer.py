@@ -171,8 +171,9 @@ def propose_next_point_llm(history, client):
                 continue
             # Naive fallback after one failed retry -- deliberately not a real
             # recovery strategy. This gap is exactly what Layer 3/the reliability
-            # layer project is meant to close.
-            rng = np.random.default_rng()
+            # layer project is meant to close. Seeded off the history length so a
+            # run that hits fallbacks is still reproducible.
+            rng = np.random.default_rng(SEED + 100_000 + len(history))
             fallback = tuple(rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1]))
             return clip_to_bounds(*fallback), "FALLBACK: unparseable response twice", text
 
@@ -230,13 +231,63 @@ def run_llm_bo(n_init, n_iter, permute_feedback=False, dry_run=False):
     return np.array(X), np.array(y), np.array(best_so_far), reasoning_log
 
 
+def make_plot(best_llm, best_classical, n_init, permute, n_fallback, out_path):
+    """Convergence plot. Kept separate from the run so a saved results file can be
+    re-plotted without spending API calls (see --replot)."""
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    iters = np.arange(len(best_llm))
+    label = "LLM proposer (permuted feedback)" if permute else "LLM proposer"
+    ax.plot(iters, best_llm, marker="o", label=label, color="tab:orange")
+    ax.plot(np.arange(len(best_classical)), best_classical, marker="s",
+            label="classical GP + EI (Layer 1)", color="tab:blue")
+    ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
+    # index 0 is the best over ALL n_init random points -- the proposer takes over at 1.
+    ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
+    ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, "
+                  f"1+ = one proposal each)")
+    ax.set_ylabel("best f(x) found so far")
+
+    title = "LLM proposer vs classical BO on Branin" + (" -- permuted feedback" if permute else "")
+    if n_fallback:
+        # Unparseable responses fell back to uniform random points. Those iterations
+        # are NOT the LLM reasoning, so the curve is part random search -- say so on
+        # the figure, otherwise the permuted result reads stronger than it is.
+        n_total = len(best_llm) - 1
+        title += (f"\ncaveat: {n_fallback}/{n_total} proposals were random fallbacks "
+                  f"(unparseable LLM response)")
+        ax.set_title(title, fontsize=11)
+    else:
+        ax.set_title(title)
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    return out_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="test the harness with no API calls")
     parser.add_argument("--permute", action="store_true", help="run the permuted-feedback sanity check")
     parser.add_argument("--n-iter", type=int, default=20)
     parser.add_argument("--n-init", type=int, default=5)
+    parser.add_argument("--replot", metavar="RESULTS_JSON",
+                        help="rebuild the plot from a saved results file instead of running "
+                             "(no API calls)")
     args = parser.parse_args()
+
+    if args.replot:
+        data = json.loads(Path(args.replot).read_text())
+        n_fallback = sum(1 for r in data["reasoning_log"] if r.startswith("FALLBACK"))
+        suffix = "_permuted" if data["permute_feedback"] else ""
+        suffix += "_dryrun" if data["dry_run"] else ""
+        out_path = make_plot(
+            np.array(data["best_so_far_llm"]), np.array(data["best_so_far_classical"]),
+            data["n_init"], data["permute_feedback"], n_fallback,
+            Path(__file__).resolve().parent / f"layer2_comparison{suffix}.png",
+        )
+        print(f"Re-plotted {args.replot} -> {out_path}")
+        print(f"  random fallbacks (unparseable LLM response): {n_fallback}/{data['n_iter']}")
+        sys.exit(0)
 
     print(f"=== Layer 2: LLM proposer (dry_run={args.dry_run}, permute={args.permute}) ===")
     X_llm, y_llm, best_llm, reasoning_log = run_llm_bo(
@@ -247,27 +298,21 @@ if __name__ == "__main__":
     print("\n=== Re-running Layer 1's classical GP+EI for comparison (no API cost) ===")
     _, _, _, best_classical, _ = run_bo(n_init=args.n_init, n_iter=args.n_iter)
 
+    n_fallback = sum(1 for r in reasoning_log if r.startswith("FALLBACK"))
     print(f"\nLLM best found:       {y_llm.min():.4f}")
     print(f"Classical best found: {best_classical[-1]:.4f}")
     print(f"True minimum:         {TRUE_MIN:.4f}")
-
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    iters = np.arange(len(best_llm))
-    label = "LLM proposer (permuted feedback)" if args.permute else "LLM proposer"
-    ax.plot(iters, best_llm, marker="o", label=label, color="tab:orange")
-    ax.plot(iters, best_classical, marker="s", label="classical GP + EI (Layer 1)", color="tab:blue")
-    ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    ax.axvline(args.n_init - 0.5, color="black", linestyle=":", alpha=0.5)
-    ax.set_xlabel("iteration (0 to n_init-1 = random init, then chosen by each method)")
-    ax.set_ylabel("best f(x) found so far")
-    ax.set_title("LLM proposer vs classical BO on Branin" + (" -- permuted feedback" if args.permute else ""))
-    ax.legend(fontsize=9)
-    plt.tight_layout()
+    if n_fallback:
+        print(f"WARNING: {n_fallback}/{args.n_iter} proposals were random fallbacks "
+              f"(unparseable LLM response) -- that fraction of this curve is random "
+              f"search, not the LLM.")
 
     suffix = "_permuted" if args.permute else ""
     suffix += "_dryrun" if args.dry_run else ""
-    out_path = Path(__file__).resolve().parent / f"layer2_comparison{suffix}.png"
-    plt.savefig(out_path, dpi=150)
+    out_path = make_plot(
+        best_llm, best_classical, args.n_init, args.permute, n_fallback,
+        Path(__file__).resolve().parent / f"layer2_comparison{suffix}.png",
+    )
     print(f"Saved plot to {out_path}")
 
     results_path = Path(__file__).resolve().parent / f"layer2_results{suffix}.json"
@@ -276,6 +321,7 @@ if __name__ == "__main__":
         "dry_run": args.dry_run,
         "n_init": args.n_init,
         "n_iter": args.n_iter,
+        "n_fallback": n_fallback,
         "best_so_far_llm": best_llm.tolist(),
         "best_so_far_classical": best_classical.tolist(),
         "reasoning_log": reasoning_log,

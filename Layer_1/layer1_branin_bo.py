@@ -139,9 +139,11 @@ if __name__ == "__main__":
     iters = np.arange(len(best_so_far))
     ax.plot(iters, best_so_far, marker="o", color="tab:blue", label="best value found")
     ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    ax.axvline(n_init - 0.5, color="black", linestyle=":", alpha=0.5)
-    ax.text(n_init - 0.5, ax.get_ylim()[1] * 0.9, " BO starts", fontsize=8, ha="left")
-    ax.set_xlabel("iteration (0-4 = random init, 5+ = EI-chosen)")
+    # index 0 is the best over ALL n_init random points, so EI takes over at index 1 --
+    # not at index n_init (the whole random design collapses into a single point here).
+    ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
+    ax.text(0.5, ax.get_ylim()[1] * 0.9, " BO starts", fontsize=8, ha="left")
+    ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, 1+ = EI-chosen)")
     ax.set_ylabel("best f(x) found so far")
     ax.set_title("Convergence toward the known optimum")
     ax.legend(fontsize=8)

@@ -46,21 +46,26 @@ load_dotenv()
 SEED = 42
 MODEL = "openai/gpt-oss-120b"  # served via Groq -- currently a Groq preview model, not GA
 MAX_TOKENS = 2000
-REASONING_EFFORT = "medium"  # qwen3.6-27b only accepts "none" (off) or "default" (thinking mode on)
-N_CANDIDATES = 5  # how many candidate points the LLM proposes per iteration
+REASONING_EFFORT = "medium"  # gpt-oss-120b accepts "low" / "medium" / "high"
+N_CANDIDATES = 5  # default number of candidate points the LLM proposes per iteration
 
-SYSTEM_PROMPT = f"""You are proposing CANDIDATE points to evaluate next in a black-box \
+
+def build_system_prompt(n_candidates):
+    """Built per-call rather than once at import, so --n-candidates actually reaches
+    the model. (A module-level f-string would freeze the count at the default and
+    silently disagree with the user message.)"""
+    return f"""You are proposing CANDIDATE points to evaluate next in a black-box \
 optimization problem. The domain is x1 in [-5, 10] and x2 in [0, 15]. \
 LOWER values are BETTER (we are minimizing). Given the history of points \
-tried and their measured values, propose {N_CANDIDATES} DIVERSE candidate points \
+tried and their measured values, propose {n_candidates} DIVERSE candidate points \
 worth considering next -- a mix of points near the best region found so far \
 and points in unexplored areas. A separate scoring step will pick the best \
 one from your candidates, so give a genuinely varied set rather than \
-{N_CANDIDATES} nearly identical points.
+{n_candidates} nearly identical points.
 
 Respond with ONLY a JSON object, no other text, in exactly this form:
 {{"candidates": [{{"x1": <float>, "x2": <float>, "reasoning": "<why this point>"}}, ...]}}
-with exactly {N_CANDIDATES} entries in the list."""
+with exactly {n_candidates} entries in the list."""
 
 
 def make_gp():
@@ -104,16 +109,16 @@ def clip_to_bounds(x1, x2):
     return x1c, x2c
 
 
-def propose_candidates_llm(history, client):
-    """Real API call asking for N_CANDIDATES points. One retry if unparseable,
-    then falls back to N_CANDIDATES random points (clearly tagged as such)."""
-    prompt = f"History so far:\n{format_history(history)}\n\nPropose {N_CANDIDATES} candidate points."
+def propose_candidates_llm(history, client, n_candidates=N_CANDIDATES):
+    """Real API call asking for n_candidates points. One retry if unparseable,
+    then falls back to n_candidates random points (clearly tagged as such)."""
+    prompt = f"History so far:\n{format_history(history)}\n\nPropose {n_candidates} candidate points."
     for attempt in range(2):
         kwargs = dict(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": build_system_prompt(n_candidates)},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -131,22 +136,24 @@ def propose_candidates_llm(history, client):
                     f"Respond with ONLY the JSON object, nothing else."
                 )
                 continue
-            rng = np.random.default_rng()
+            # Seeded off the history length so a run that hits fallbacks stays reproducible.
+            rng = np.random.default_rng(SEED + 100_000 + len(history))
             fallback = [
                 (*clip_to_bounds(*p), "FALLBACK: unparseable response twice")
-                for p in rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(N_CANDIDATES, 2))
+                for p in rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(n_candidates, 2))
             ]
             return fallback, text
 
 
-def propose_candidates_dry_run(rng):
+def propose_candidates_dry_run(rng, n_candidates=N_CANDIDATES):
     return [
         (*clip_to_bounds(*p), "dry-run stub")
-        for p in rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(N_CANDIDATES, 2))
+        for p in rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(n_candidates, 2))
     ]
 
 
-def run_hybrid_bo(n_init, n_iter, dry_run=False, n_random_candidates=20):
+def run_hybrid_bo(n_init, n_iter, dry_run=False, n_random_candidates=20,
+                  n_candidates=N_CANDIDATES):
     rng = np.random.default_rng(SEED)
 
     client = None
@@ -168,10 +175,10 @@ def run_hybrid_bo(n_init, n_iter, dry_run=False, n_random_candidates=20):
         gp.fit(X, y)
 
         if dry_run:
-            llm_points = propose_candidates_dry_run(rng)
+            llm_points = propose_candidates_dry_run(rng, n_candidates)
             raw = ""
         else:
-            llm_points, raw = propose_candidates_llm(history, client)
+            llm_points, raw = propose_candidates_llm(history, client, n_candidates)
 
         random_points = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(n_random_candidates, 2))
         llm_xy = np.array([[p[0], p[1]] for p in llm_points])
@@ -197,44 +204,86 @@ def run_hybrid_bo(n_init, n_iter, dry_run=False, n_random_candidates=20):
     return np.array(X), np.array(y), np.array(best_so_far), reasoning_log, llm_won_log
 
 
+def make_plot(best_hybrid, best_classical, n_init, llm_win_rate, chance, out_path):
+    """Kept separate from the run so a saved results file can be re-plotted without
+    spending API calls (see --replot)."""
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    ax.plot(np.arange(len(best_hybrid)), best_hybrid, marker="o",
+            label="hybrid (LLM candidates + real EI)", color="tab:green")
+    ax.plot(np.arange(len(best_classical)), best_classical, marker="s",
+            label="classical GP + EI (Layer 1)", color="tab:blue")
+    ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
+    # index 0 is the best over ALL n_init random points -- the hybrid takes over at 1.
+    ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
+    ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, "
+                  f"1+ = one evaluation each)")
+    ax.set_ylabel("best f(x) found so far")
+    # The two curves do NOT get equal acquisition search: classical scans an 80x80 grid,
+    # the hybrid only its candidate pool. Say so on the figure, not just in the console.
+    ax.set_title(f"Hybrid vs classical BO on Branin\n"
+                 f"LLM win rate: {llm_win_rate*100:.0f}% (chance baseline {chance*100:.0f}%)"
+                 f"  |  caveat: classical searches a 6400-point EI grid,\n"
+                 f"the hybrid only its candidate pool",
+                 fontsize=10)
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    return out_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--n-iter", type=int, default=20)
     parser.add_argument("--n-init", type=int, default=5)
     parser.add_argument("--n-candidates", type=int, default=N_CANDIDATES)
+    parser.add_argument("--n-random-candidates", type=int, default=20,
+                        help="random filler candidates EI scores alongside the LLM's")
+    parser.add_argument("--replot", metavar="RESULTS_JSON",
+                        help="rebuild the plot from a saved results file instead of "
+                             "running (no API calls)")
     args = parser.parse_args()
-    N_CANDIDATES = args.n_candidates  # note: only affects future calls if SYSTEM_PROMPT already built above
+
+    if args.replot:
+        d = json.loads(Path(args.replot).read_text())
+        n_pool = d["n_candidates"] + d.get("n_random_candidates", 20)
+        rate = sum(d["llm_won_log"]) / len(d["llm_won_log"]) if d["llm_won_log"] else 0.0
+        suffix = "_dryrun" if d["dry_run"] else ""
+        out_path = make_plot(
+            np.array(d["best_so_far_hybrid"]), np.array(d["best_so_far_classical"]),
+            d["n_init"], rate, d["n_candidates"] / n_pool,
+            Path(__file__).resolve().parent / f"layer3_comparison{suffix}.png",
+        )
+        print(f"Re-plotted {args.replot} -> {out_path}")
+        sys.exit(0)
 
     print(f"=== Layer 3: hybrid LLM-candidates + real EI (dry_run={args.dry_run}) ===")
     X_h, y_h, best_hybrid, reasoning_log, llm_won_log = run_hybrid_bo(
         n_init=args.n_init, n_iter=args.n_iter, dry_run=args.dry_run,
+        n_random_candidates=args.n_random_candidates, n_candidates=args.n_candidates,
     )
 
     print("\n=== Re-running Layer 1's classical GP+EI for comparison ===")
     _, _, _, best_classical, _ = run_bo(n_init=args.n_init, n_iter=args.n_iter)
 
     llm_win_rate = sum(llm_won_log) / len(llm_won_log) if llm_won_log else 0.0
+    n_pool = args.n_candidates + args.n_random_candidates
+    chance = args.n_candidates / n_pool  # LLM only holds this share of the candidate slots
     print(f"\nHybrid best found:    {y_h.min():.4f}")
     print(f"Classical best found: {best_classical[-1]:.4f}")
     print(f"True minimum:         {TRUE_MIN:.4f}")
-    print(f"LLM candidate win rate: {llm_win_rate*100:.0f}% ({sum(llm_won_log)}/{len(llm_won_log)} iterations)")
-
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    iters = np.arange(len(best_hybrid))
-    ax.plot(iters, best_hybrid, marker="o", label="hybrid (LLM candidates + real EI)", color="tab:green")
-    ax.plot(iters, best_classical, marker="s", label="classical GP + EI (Layer 1)", color="tab:blue")
-    ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    ax.axvline(args.n_init - 0.5, color="black", linestyle=":", alpha=0.5)
-    ax.set_xlabel("iteration")
-    ax.set_ylabel("best f(x) found so far")
-    ax.set_title(f"Hybrid vs classical BO on Branin (LLM win rate: {llm_win_rate*100:.0f}%)")
-    ax.legend(fontsize=9)
-    plt.tight_layout()
+    print(f"LLM candidate win rate: {llm_win_rate*100:.0f}% "
+          f"({sum(llm_won_log)}/{len(llm_won_log)} iterations)  -- chance baseline is "
+          f"{chance*100:.0f}% ({args.n_candidates} LLM candidates out of {n_pool} total)")
+    print("NOTE: classical BO above maximizes EI over a "
+          f"{80*80}-point grid, the hybrid over only {n_pool} candidates -- part of any "
+          "gap is acquisition-search strength, not candidate quality.")
 
     suffix = "_dryrun" if args.dry_run else ""
-    out_path = Path(__file__).resolve().parent / f"layer3_comparison{suffix}.png"
-    plt.savefig(out_path, dpi=150)
+    out_path = make_plot(
+        best_hybrid, best_classical, args.n_init, llm_win_rate, chance,
+        Path(__file__).resolve().parent / f"layer3_comparison{suffix}.png",
+    )
     print(f"Saved plot to {out_path}")
 
     results_path = Path(__file__).resolve().parent / f"layer3_results{suffix}.json"
@@ -243,6 +292,9 @@ if __name__ == "__main__":
         "n_init": args.n_init,
         "n_iter": args.n_iter,
         "n_candidates": args.n_candidates,
+        "n_random_candidates": args.n_random_candidates,
+        "llm_win_rate": llm_win_rate,
+        "llm_win_rate_chance_baseline": chance,
         "best_so_far_hybrid": best_hybrid.tolist(),
         "best_so_far_classical": best_classical.tolist(),
         "llm_won_log": llm_won_log,

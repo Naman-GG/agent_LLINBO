@@ -15,9 +15,14 @@ around 1 near an already-sampled point and 10-40 at genuinely unexplored
 ones, so UNCERTAINTY_THRESHOLD=20 flags the clearly-unexplored tail without
 flagging routine exploitation.
 
-On reject: the risky candidate is dropped and a random point is substituted
-instead -- the human veto removes the risky choice, it doesn't get to
-silently keep it.
+On reject: the risky candidate is dropped and the highest-EI candidate whose
+sigma is already BELOW the threshold is run instead. Substituting a uniform
+random point (the obvious first instinct) is actively wrong here -- a random
+point in a barely-sampled domain is typically MORE uncertain than the one the
+human just vetoed, so the veto would increase the very risk it exists to
+contain. Falling back within the scored pool means "reject" says what a human
+actually means by it: don't gamble, run the best option we already understand.
+Only if no candidate clears the threshold do we resort to a random point.
 
 Usage:
     python3 layer4_hitl.py                      # real run, prompts you at each interrupt
@@ -42,13 +47,29 @@ from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
 
 from Layer_1.layer1_branin_bo import branin, BOUNDS, TRUE_MIN, expected_improvement, run_bo
-from Layer_3.layer3_hybrid import make_gp, propose_candidates_llm, propose_candidates_dry_run
+from Layer_3.layer3_hybrid import (
+    make_gp, propose_candidates_llm, propose_candidates_dry_run,
+    N_CANDIDATES as L3_N_CANDIDATES,
+)
 
 load_dotenv()
 
 SEED = 42
 UNCERTAINTY_THRESHOLD = 20.0  # calibrated against this project's GP -- see module docstring
 N_RANDOM_CANDIDATES = 20
+N_LLM_CANDIDATES = L3_N_CANDIDATES  # whatever Layer 3's proposer defaults to
+
+_CLIENT = None
+
+
+def get_client():
+    """One client for the whole run -- propose_and_score_node fires once per
+    iteration and rebuilding it each time is pure overhead."""
+    global _CLIENT
+    if _CLIENT is None:
+        import groq
+        _CLIENT = groq.Groq()
+    return _CLIENT
 
 
 class BOState(TypedDict):
@@ -61,6 +82,7 @@ class BOState(TypedDict):
     llm_won_log: list
     approval_log: list
     pending: dict
+    ei_winner_llm: bool  # did an LLM candidate win EI scoring? recorded BEFORE any veto
 
 
 def propose_and_score_node(state: BOState) -> dict:
@@ -74,9 +96,7 @@ def propose_and_score_node(state: BOState) -> dict:
     if state["dry_run"]:
         llm_points = propose_candidates_dry_run(np.random.default_rng(SEED + state["iteration"] + 200_000))
     else:
-        import groq
-        client = groq.Groq()
-        llm_points, _ = propose_candidates_llm(history, client)
+        llm_points, _ = propose_candidates_llm(history, get_client())
 
     rng = np.random.default_rng(SEED + state["iteration"])
     random_points = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1], size=(N_RANDOM_CANDIDATES, 2))
@@ -89,15 +109,29 @@ def propose_and_score_node(state: BOState) -> dict:
     won_by_llm = best_idx < len(llm_points)
     reasoning = llm_points[best_idx][2] if won_by_llm else "EI picked a random filler candidate over every LLM one"
 
-    _, sigma_arr = gp.predict(next_x.reshape(1, -1), return_std=True)
-    sigma = float(sigma_arr[0])
+    _, sigma_all = gp.predict(all_candidates, return_std=True)
+    sigma = float(sigma_all[best_idx])
+
+    # Best candidate the GP is ALREADY confident about, for the reject path. Picking
+    # it here (rather than sampling a fresh random point at veto time) is what keeps
+    # a rejection from landing somewhere even less explored than what was vetoed.
+    safe = [j for j in np.argsort(ei)[::-1] if sigma_all[j] <= UNCERTAINTY_THRESHOLD]
+    fallback = None
+    if safe:
+        j = int(safe[0])
+        fallback = {
+            "x1": float(all_candidates[j][0]), "x2": float(all_candidates[j][1]),
+            "sigma": float(sigma_all[j]), "ei": float(ei[j]),
+            "won_by_llm": bool(j < len(llm_points)),
+        }
 
     pending = {
         "x1": float(next_x[0]), "x2": float(next_x[1]),
         "sigma": sigma, "ei": float(ei[best_idx]),
         "won_by_llm": won_by_llm, "reasoning": reasoning,
+        "fallback": fallback,
     }
-    return {"pending": pending}
+    return {"pending": pending, "ei_winner_llm": won_by_llm}
 
 
 def route_after_scoring(state: BOState) -> str:
@@ -117,13 +151,21 @@ def human_review_node(state: BOState) -> dict:
     if approved:
         return {"approval_log": state["approval_log"] + [log_entry]}
 
-    rng = np.random.default_rng(SEED + state["iteration"] + 100_000)
-    fallback_x = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1])
-    new_pending = {
-        "x1": float(fallback_x[0]), "x2": float(fallback_x[1]),
-        "sigma": None, "ei": None, "won_by_llm": False,
-        "reasoning": "Human rejected the high-uncertainty candidate; fell back to a random point.",
-    }
+    fb = p.get("fallback")
+    if fb is None:
+        # Nothing in the pool cleared the threshold -- everything is unexplored, so a
+        # random point is no worse than the alternatives. Rare, and flagged as such.
+        rng = np.random.default_rng(SEED + state["iteration"] + 100_000)
+        fallback_x = rng.uniform(BOUNDS[:, 0], BOUNDS[:, 1])
+        fb = {"x1": float(fallback_x[0]), "x2": float(fallback_x[1]),
+              "sigma": None, "ei": None, "won_by_llm": False}
+        why = ("Human rejected the high-uncertainty candidate; NO candidate was under "
+               "the threshold, so fell back to a random point.")
+    else:
+        why = (f"Human rejected the high-uncertainty candidate (sigma={p['sigma']:.1f}); "
+               f"ran the best candidate under the threshold instead "
+               f"(sigma={fb['sigma']:.1f}).")
+    new_pending = {**fb, "fallback": None, "reasoning": why}
     return {"pending": new_pending, "approval_log": state["approval_log"] + [log_entry]}
 
 
@@ -133,7 +175,9 @@ def evaluate_node(state: BOState) -> dict:
     X = state["X"] + [[p["x1"], p["x2"]]]
     y = state["y"] + [y_new]
     reasoning_log = state["reasoning_log"] + [p["reasoning"]]
-    llm_won_log = state["llm_won_log"] + [p["won_by_llm"]]
+    # the point that WON EI scoring, before any human veto -- vetoing an LLM candidate
+    # is a fact about the human, not evidence the LLM's candidate was worse.
+    llm_won_log = state["llm_won_log"] + [state["ei_winner_llm"]]
 
     best_so_far = min(y)
     sigma_str = f"{p['sigma']:6.2f}" if p["sigma"] is not None else "  n/a "
@@ -181,6 +225,7 @@ def run_with_human_in_the_loop(n_init, n_iter, dry_run=False, auto_approve=None,
         "X": X_init.tolist(), "y": y_init.tolist(),
         "iteration": 0, "n_iter": n_iter, "dry_run": dry_run,
         "reasoning_log": [], "llm_won_log": [], "approval_log": [], "pending": {},
+        "ei_winner_llm": False,
     }
     config = {"configurable": {"thread_id": thread_id}}
     result = app.invoke(initial_state, config=config)
@@ -208,6 +253,40 @@ def run_with_human_in_the_loop(n_init, n_iter, dry_run=False, auto_approve=None,
     return np.array(result["X"]), np.array(result["y"]), result["reasoning_log"], result["llm_won_log"], result["approval_log"]
 
 
+def make_plot(best_so_far, best_classical, approval_log, n_init, out_path):
+    """Kept separate from the run so a saved results file can be re-plotted without
+    spending API calls (see --replot)."""
+    n_flagged = len(approval_log)
+    n_approved = sum(1 for a in approval_log if a["human_approved"])
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    ax.plot(np.arange(len(best_so_far)), best_so_far, marker="o",
+            label="hybrid + HITL", color="tab:purple")
+    ax.plot(np.arange(len(best_classical)), best_classical, marker="s",
+            label="classical GP + EI (Layer 1)", color="tab:blue")
+    # Label the first of EACH kind -- keying off approval_log[0] alone drops whichever
+    # outcome didn't happen to come first from the legend entirely.
+    labelled = set()
+    for a in approval_log:
+        ok = a["human_approved"]
+        marker, color = ("^", "green") if ok else ("x", "red")
+        ax.scatter(a["iteration"], best_so_far[min(a["iteration"], len(best_so_far) - 1)],
+                   marker=marker, color=color, s=120, zorder=5,
+                   label=None if ok in labelled else ("approved" if ok else "rejected"))
+        labelled.add(ok)
+    ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
+    # index 0 is the best over ALL n_init random points -- the loop takes over at 1.
+    ax.axvline(0.5, color="black", linestyle=":", alpha=0.5)
+    ax.set_xlabel(f"iteration (0 = best of the {n_init} random init points, "
+                  f"1+ = one evaluation each)")
+    ax.set_ylabel("best f(x) found so far")
+    ax.set_title(f"Hybrid + HITL vs classical BO ({n_flagged} interrupts, {n_approved} approved)")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    return out_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -215,8 +294,24 @@ if __name__ == "__main__":
     parser.add_argument("--auto-reject", action="store_true", help="skip prompts, always reject (testing)")
     parser.add_argument("--n-iter", type=int, default=25)
     parser.add_argument("--n-init", type=int, default=5)
+    parser.add_argument("--replot", metavar="RESULTS_JSON",
+                        help="rebuild the plot from a saved results file instead of "
+                             "running (no API calls)")
     args = parser.parse_args()
 
+    if args.replot:
+        d = json.loads(Path(args.replot).read_text())
+        suffix = "_dryrun" if d["dry_run"] else ""
+        out_path = make_plot(
+            np.array(d["best_so_far"]), np.array(d["best_so_far_classical"]),
+            d["approval_log"], d["n_init"],
+            Path(__file__).resolve().parent / f"layer4_comparison{suffix}.png",
+        )
+        print(f"Re-plotted {args.replot} -> {out_path}")
+        sys.exit(0)
+
+    if args.auto_approve and args.auto_reject:
+        parser.error("--auto-approve and --auto-reject are mutually exclusive")
     auto = True if args.auto_approve else (False if args.auto_reject else None)
 
     print(f"=== Layer 4: hybrid + LangGraph human-in-the-loop (dry_run={args.dry_run}) ===")
@@ -240,29 +335,18 @@ if __name__ == "__main__":
           f"({n_approved} approved, {n_flagged - n_approved} rejected)")
 
     llm_win_rate = sum(llm_won_log) / len(llm_won_log) if llm_won_log else 0.0
-    print(f"LLM candidate win rate: {llm_win_rate*100:.0f}% ({sum(llm_won_log)}/{len(llm_won_log)} iterations)  "
-          f"-- chance baseline is ~20% (5 LLM candidates out of 25 total)")
-
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    iters = np.arange(len(best_so_far))
-    ax.plot(iters, best_so_far, marker="o", label="hybrid + HITL", color="tab:purple")
-    ax.plot(np.arange(len(best_classical)), best_classical, marker="s", label="classical GP + EI (Layer 1)", color="tab:blue")
-    for a in approval_log:
-        marker = "^" if a["human_approved"] else "x"
-        color = "green" if a["human_approved"] else "red"
-        ax.scatter(a["iteration"], best_so_far[min(a["iteration"], len(best_so_far) - 1)],
-                    marker=marker, color=color, s=120, zorder=5,
-                    label=("approved" if a["human_approved"] else "rejected") if a is approval_log[0] else None)
-    ax.axhline(TRUE_MIN, color="gray", linestyle="--", label=f"true global min ({TRUE_MIN:.3f})")
-    ax.set_xlabel("iteration")
-    ax.set_ylabel("best f(x) found so far")
-    ax.set_title(f"Hybrid + HITL vs classical BO ({n_flagged} interrupts, {n_approved} approved)")
-    ax.legend(fontsize=8)
-    plt.tight_layout()
+    n_pool = N_LLM_CANDIDATES + N_RANDOM_CANDIDATES
+    chance = N_LLM_CANDIDATES / n_pool
+    print(f"LLM candidate win rate: {llm_win_rate*100:.0f}% "
+          f"({sum(llm_won_log)}/{len(llm_won_log)} iterations)  -- chance baseline is "
+          f"{chance*100:.0f}% ({N_LLM_CANDIDATES} LLM candidates out of {n_pool} total). "
+          f"Measured on EI scoring, before human vetoes.")
 
     suffix = "_dryrun" if args.dry_run else ""
-    out_path = Path(__file__).resolve().parent / f"layer4_comparison{suffix}.png"
-    plt.savefig(out_path, dpi=150)
+    out_path = make_plot(
+        best_so_far, best_classical, approval_log, args.n_init,
+        Path(__file__).resolve().parent / f"layer4_comparison{suffix}.png",
+    )
     print(f"Saved plot to {out_path}")
 
     results_path = Path(__file__).resolve().parent / f"layer4_results{suffix}.json"
@@ -271,6 +355,8 @@ if __name__ == "__main__":
         "n_init": args.n_init,
         "n_iter": args.n_iter,
         "uncertainty_threshold": UNCERTAINTY_THRESHOLD,
+        "llm_win_rate": llm_win_rate,
+        "llm_win_rate_chance_baseline": chance,
         "best_so_far": best_so_far.tolist(),
         "best_so_far_classical": best_classical.tolist(),
         "approval_log": approval_log,
