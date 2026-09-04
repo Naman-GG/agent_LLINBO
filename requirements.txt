@@ -5,4 +5,8 @@ scipy
 pandas
 seaborn
 groq
+cerebras_cloud_sdk
 python-dotenv
+google-genai
+openai
+langgraph

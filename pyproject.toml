@@ -8,10 +8,14 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "cerebras-cloud-sdk>=1.91.0",
     "dotenv>=0.9.9",
+    "google-genai>=2.20.0",
     "groq>=1.7.0",
+    "langgraph>=1.2.11",
     "matplotlib>=3.11.1",
     "numpy>=2.5.2",
+    "openai>=3.6.0",
     "pandas>=3.0.5",
     "python-dotenv>=1.2.3",
     "scikit-learn>=1.9.0",
